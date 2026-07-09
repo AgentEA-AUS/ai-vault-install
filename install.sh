@@ -365,6 +365,9 @@ done
 echo ""
 
 if [ "$SYNCED" != "1" ]; then
+    if [ -n "$TOKEN" ]; then
+        die "The vault did not arrive. Your invite may have expired or already been used on another computer — ask AgentEA for a fresh invite, then paste the new line they send you."
+    fi
     die "The vault is taking longer than expected to arrive. Leave this window open — it keeps trying in the background."
 fi
 echo "  Your vault has arrived: $VAULT_DIR"
