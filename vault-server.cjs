@@ -15487,7 +15487,10 @@ var INSTRUCTIONS = [
   "Call `vault_guide` FIRST in a conversation before answering questions about the vault; it returns the vault's own agent instructions and a folder map.",
   "Layer precedence when notes conflict: Canonical/ (human-verified) overrides wiki/ (AI synthesis) overrides raw/ (verbatim source records).",
   "Always search the vault before answering from memory. Cite the note path for every fact.",
-  "If the vault has no answer, say so \u2014 never invent one."
+  "If the vault has no answer, say so \u2014 never invent one.",
+  "You can also WRITE notes with `write_note` \u2014 new notes and content updates land in wiki/ and other working areas.",
+  "Canonical/ and raw/ are human-owned and immutable, and the root _CLAUDE.md/CLAUDE.md are the vault's own instructions: writes to any of these are refused.",
+  "When writing, follow the vault's own note conventions: frontmatter with date/type/title, a '## For future Claude' preamble for wiki notes, and cite the sources a note is built from."
 ].join(" ");
 function isInside(root, target) {
   const rel = import_node_path.default.relative(root, target);
@@ -15643,6 +15646,18 @@ function vaultGuide() {
       "## Vault agent instructions\n\n(No _CLAUDE.md or CLAUDE.md found at the vault root.)\n"
     );
   }
+  parts.push("## Writing notes\n");
+  parts.push(
+    [
+      "Writes are allowed via `write_note` and land in wiki/ and other working areas.",
+      "Protected layers are refused: Canonical/ and raw/ (human-owned) and the root _CLAUDE.md/CLAUDE.md.",
+      "Follow the vault's own conventions when you write:",
+      "- Start markdown files with frontmatter (date, type, title).",
+      "- For wiki/ notes, open with a '## For future Claude' preamble that states what the note is and why it exists.",
+      "- Cite the sources a note is synthesised from.",
+      "`write_note` supports mode create (new file) and append (add to an existing file). There is no blind-overwrite: to change a note, read it, then append \u2014 this prevents silently deleting someone else's edit.\n"
+    ].join("\n")
+  );
   parts.push("## Folder map (top two levels)\n");
   parts.push(buildFolderMap());
   return parts.join("\n");
@@ -15857,6 +15872,192 @@ function listFolder(args) {
   );
   return lines.join("\n");
 }
+var PROTECTED_MSG = "Refused: Canonical/ and raw/ are human-owned, immutable layers, and the root _CLAUDE.md / CLAUDE.md are the vault's protected instruction files. Write to wiki/ or another working area instead.";
+function writeNote(args) {
+  const rawPath = String(args.path || "").trim();
+  if (!rawPath) throw new Error("`path` is required.");
+  const content = args.content;
+  if (typeof content !== "string") {
+    throw new Error("`content` is required and must be a string.");
+  }
+  const mode = args.mode === void 0 ? "create" : String(args.mode);
+  if (!["create", "append"].includes(mode)) {
+    throw new Error(
+      `Invalid mode "${mode}". Use "create" (new note) or "append" (add to an existing note). Blind overwrite is not supported \u2014 read the note and append instead.`
+    );
+  }
+  const inputBytes = Buffer.byteLength(content, "utf8");
+  if (inputBytes > MAX_READ_BYTES) {
+    throw new Error(
+      `Content too large: ${inputBytes} bytes (max ${MAX_READ_BYTES}).`
+    );
+  }
+  if (import_node_path.default.isAbsolute(rawPath)) {
+    throw new Error(
+      "Access denied: absolute paths are not allowed. Use a vault-relative path."
+    );
+  }
+  const rawSegs = rawPath.split(/[\\/]+/);
+  if (rawSegs.includes("..")) {
+    throw new Error("Access denied: '..' path traversal is not allowed.");
+  }
+  if (!rawPath.toLowerCase().endsWith(".md")) {
+    throw new Error("Only markdown (.md) files can be written.");
+  }
+  const resolved = import_node_path.default.resolve(VAULT_ROOT, rawPath);
+  if (!isInside(VAULT_ROOT, resolved)) {
+    throw new Error("Access denied: path is outside the vault.");
+  }
+  const rel = relPath(resolved);
+  const relLower = rel.toLowerCase();
+  const segs = relLower.split("/");
+  const parentSegs = segs.slice(0, -1);
+  if (parentSegs.includes("canonical") || parentSegs.includes("raw") || relLower === "_claude.md" || relLower === "claude.md") {
+    throw new Error(PROTECTED_MSG);
+  }
+  const relSegs = rel.split("/");
+  let cur = VAULT_ROOT;
+  for (let i = 0; i < relSegs.length; i++) {
+    cur = import_node_path.default.join(cur, relSegs[i]);
+    let st;
+    try {
+      st = import_node_fs.default.lstatSync(cur);
+    } catch {
+      break;
+    }
+    if (st.isSymbolicLink()) {
+      throw new Error(
+        "Access denied: a symlink exists in the target path; refusing to follow it."
+      );
+    }
+  }
+  const parentDir = import_node_path.default.dirname(resolved);
+  import_node_fs.default.mkdirSync(parentDir, { recursive: true });
+  const realParent = safeRealInside(parentDir);
+  if (!realParent) {
+    throw new Error("Access denied: target directory resolves outside the vault.");
+  }
+  const realParentRel = import_node_path.default.relative(VAULT_ROOT, realParent).split(import_node_path.default.sep).join("/").toLowerCase();
+  const realParentSegs = realParentRel ? realParentRel.split("/") : [];
+  if (realParentSegs.includes("raw") || realParentSegs.includes("canonical")) {
+    throw new Error(PROTECTED_MSG);
+  }
+  const parentIdent = import_node_fs.default.statSync(realParent);
+  let targetStat = null;
+  try {
+    targetStat = import_node_fs.default.lstatSync(resolved);
+  } catch {
+  }
+  if (targetStat && targetStat.isSymbolicLink()) {
+    throw new Error("Access denied: target is a symlink; refusing to follow it.");
+  }
+  const exists = targetStat !== null;
+  if (mode === "create" && exists) {
+    throw new Error(
+      `File already exists: ${rel}. Use mode "append" to add to it (read it first, then append).`
+    );
+  }
+  if (mode === "append" && !exists) {
+    throw new Error(
+      `File does not exist: ${rel}. Use mode "create" to create it.`
+    );
+  }
+  const APPEND_MAX = MAX_READ_BYTES * 4;
+  const contentBytes = Buffer.byteLength(content, "utf8");
+  const noFollow = import_node_fs.default.constants.O_NOFOLLOW ?? 0;
+  const preWriteParent = safeRealInside(parentDir);
+  let preWriteOk = false;
+  if (preWriteParent) {
+    try {
+      const now = import_node_fs.default.statSync(preWriteParent);
+      preWriteOk = now.dev === parentIdent.dev && now.ino === parentIdent.ino;
+    } catch {
+      preWriteOk = false;
+    }
+  }
+  if (!preWriteOk) {
+    throw new Error(
+      "Access denied: the target directory changed during the write; aborted with no changes."
+    );
+  }
+  let finalBytes;
+  if (mode === "create") {
+    let fd;
+    try {
+      fd = import_node_fs.default.openSync(
+        resolved,
+        import_node_fs.default.constants.O_WRONLY | import_node_fs.default.constants.O_CREAT | import_node_fs.default.constants.O_EXCL | noFollow,
+        420
+      );
+    } catch (err) {
+      if (err && err.code === "EEXIST") {
+        throw new Error(
+          `File already exists: ${rel}. Use mode "append" to add to it (read it first, then append).`
+        );
+      }
+      if (err && err.code === "ELOOP") {
+        throw new Error("Access denied: target is a symlink; refusing to follow it.");
+      }
+      throw err;
+    }
+    try {
+      import_node_fs.default.writeFileSync(fd, content);
+      import_node_fs.default.fsyncSync(fd);
+    } catch (err) {
+      try {
+        import_node_fs.default.closeSync(fd);
+      } catch {
+      }
+      try {
+        import_node_fs.default.unlinkSync(resolved);
+      } catch {
+      }
+      throw new Error(
+        `Could not finish writing ${rel} (${err.code || err.message}); the partial note was removed. No changes kept.`
+      );
+    }
+    import_node_fs.default.closeSync(fd);
+    finalBytes = contentBytes;
+  } else {
+    let fd;
+    try {
+      fd = import_node_fs.default.openSync(
+        resolved,
+        import_node_fs.default.constants.O_RDWR | import_node_fs.default.constants.O_APPEND | noFollow
+      );
+    } catch (err) {
+      if (err && err.code === "ELOOP") {
+        throw new Error("Access denied: target is a symlink; refusing to follow it.");
+      }
+      throw new Error(
+        `Cannot append: the note ${rel} could not be opened. No changes made.`
+      );
+    }
+    try {
+      const st = import_node_fs.default.fstatSync(fd);
+      if (!st.isFile()) {
+        throw new Error(`Cannot append: ${rel} is not a regular file.`);
+      }
+      if (st.size + contentBytes + 1 > APPEND_MAX) {
+        throw new Error(
+          `Resulting note too large: ~${st.size + contentBytes} bytes (max ${APPEND_MAX}). No changes made.`
+        );
+      }
+      let sep = "";
+      if (st.size > 0) {
+        const one = Buffer.alloc(1);
+        import_node_fs.default.readSync(fd, one, 0, 1, st.size - 1);
+        if (one[0] !== 10) sep = "\n";
+      }
+      import_node_fs.default.writeSync(fd, sep + content);
+      import_node_fs.default.fsyncSync(fd);
+      finalBytes = contentBytes + sep.length;
+    } finally {
+      import_node_fs.default.closeSync(fd);
+    }
+  }
+  return `Wrote ${rel} (${finalBytes} bytes, mode=${mode}).`;
+}
 var TOOLS = [
   {
     name: "vault_guide",
@@ -15905,10 +16106,31 @@ var TOOLS = [
       },
       additionalProperties: false
     }
+  },
+  {
+    name: "write_note",
+    description: "Create or update a markdown note in the vault. Writes land in wiki/ and other working areas; the human-owned Canonical/ and raw/ layers and the root _CLAUDE.md/CLAUDE.md are protected and refused. Follow the vault's own conventions: frontmatter (date/type/title), a '## For future Claude' preamble for wiki notes, and cite sources. There is no delete or rename \u2014 creation and content updates only.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        path: {
+          type: "string",
+          description: "Vault-relative path ending in .md (e.g. 'wiki/synthesis/2026-07-09-topic.md')."
+        },
+        content: { type: "string", description: "Full markdown content to write (max 1MB)." },
+        mode: {
+          type: "string",
+          enum: ["create", "append"],
+          description: "create (default; fails if the note already exists) or append (note must exist; adds with a separating newline). There is no overwrite mode."
+        }
+      },
+      required: ["path", "content"],
+      additionalProperties: false
+    }
   }
 ];
 var server = new Server(
-  { name: "ai-vault", version: "0.1.0" },
+  { name: "ai-vault", version: "0.2.0" },
   { capabilities: { tools: {} }, instructions: INSTRUCTIONS }
 );
 server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }));
@@ -15928,6 +16150,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         break;
       case "list_folder":
         payload = listFolder(args);
+        break;
+      case "write_note":
+        payload = writeNote(args);
         break;
       default:
         throw new Error(`Unknown tool: ${name}`);

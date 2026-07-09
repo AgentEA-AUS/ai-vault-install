@@ -1,10 +1,10 @@
-# AI Vault installer — AgentEA (Windows)
+﻿# AI Vault installer  - AgentEA (Windows)
 # Sets up a private, receive-only copy of your business vault on this PC and
 # opens the AI-Vault extension installer for Claude Desktop.
 #
-# Works on stock Windows 10/11 PowerShell 5.1 — no admin rights needed anywhere.
+# Works on stock Windows 10/11 PowerShell 5.1  - no admin rights needed anywhere.
 #
-# Usage (normal install — usually pasted as one invite line):
+# Usage (normal install  - usually pasted as one invite line):
 #   powershell -ExecutionPolicy Bypass -File install.ps1
 #   powershell -ExecutionPolicy Bypass -File install.ps1 -ServerId <ID> -FolderId <ID> `
 #       -Label <person> -Token <TOKEN> [-ClientPrefix <p>] [-McpbUrl <URL>]
@@ -96,7 +96,7 @@ function Fail([string]$Message) {
 
 $script:ApiKey = ''
 function Invoke-StApi {
-    # Talk to our private sync program. Throws on failure — wrap in try/catch
+    # Talk to our private sync program. Throws on failure  - wrap in try/catch
     # when a failure is expected (e.g. polling before it's up).
     param(
         [string]$Method = 'Get',
@@ -163,7 +163,7 @@ if ($Uninstall) {
 # ---------- 1. banner + preflight ---------------------------------------------
 Write-Host ''
 Write-Host '============================================================'
-Write-Host '   AI VAULT SETUP  —  AgentEA'
+Write-Host '   AI VAULT SETUP   -  AgentEA'
 Write-Host '   We are going to connect this PC to your business vault.'
 Write-Host '   This takes about 5 minutes. Leave this window open.'
 Write-Host '============================================================'
@@ -177,7 +177,7 @@ if ($env:OS -ne 'Windows_NT') {
     Fail 'This installer only works on a Windows PC. On a Mac or Linux computer, use the install.sh line instead.'
 }
 
-# Claude Desktop check — best effort, never a blocker.
+# Claude Desktop check  - best effort, never a blocker.
 $claudeFound = $false
 if ($env:LOCALAPPDATA -and (Test-Path (Join-Path $env:LOCALAPPDATA 'AnthropicClaude'))) {
     $claudeFound = $true
@@ -219,11 +219,13 @@ New-Item -ItemType Directory -Path $BinDir -Force | Out-Null
 New-Item -ItemType Directory -Path $VaultDir -Force | Out-Null
 
 if (Test-Path $Bin) {
-    Write-Host 'Step 1 of 5: Sync program already downloaded — skipping.'
+    Write-Host 'Step 1 of 5: Sync program already downloaded  - skipping.'
 } else {
     Write-Host 'Step 1 of 5: Downloading the sync program (about 11 MB)...'
     try {
-        $release = Invoke-RestMethod -Uri 'https://api.github.com/repos/syncthing/syncthing/releases/latest' -TimeoutSec 60
+        $relHeaders = @{}
+        if ($env:AIVAULT_GH_TOKEN) { $relHeaders['Authorization'] = "Bearer $($env:AIVAULT_GH_TOKEN)" }
+        $release = Invoke-RestMethod -Uri 'https://api.github.com/repos/syncthing/syncthing/releases/latest' -Headers $relHeaders -TimeoutSec 60
     } catch {
         Fail 'Could not reach the download site. Check this PC is online, then run the installer again.'
     }
@@ -260,7 +262,7 @@ if (Test-Path $Bin) {
 # ---------- 3. create this PC's private identity + settings --------------------
 Write-Host "Step 2 of 5: Setting up this PC's private connection..."
 if ((Test-Path $CfgPath) -and (Test-Path (Join-Path $StHome 'cert.pem'))) {
-    Write-Host '  Already set up from an earlier run — keeping it.'
+    Write-Host '  Already set up from an earlier run  - keeping it.'
 } else {
     # PS 5.1 quirk: redirecting a native command's error output while
     # $ErrorActionPreference is 'Stop' can throw a bogus NativeCommandError.
@@ -321,6 +323,42 @@ if ((Test-Path $CfgPath) -and (Test-Path (Join-Path $StHome 'cert.pem'))) {
         # has id="" and stays.)
         foreach ($node in @($cfg.SelectNodes("folder[@id='default']"))) { [void]$cfg.RemoveChild($node) }
 
+        # Seed the WHOLE connection structure into the config BEFORE first start:
+        # the local device's announced name, the AgentEA server device, and the
+        # two-way vault folder listing both devices. This is the Windows fix -- a
+        # Windows client would not adopt a folder/device injected over REST after
+        # start into its live cluster-config, so it announced the folder without
+        # the server device and the server kept dropping it. Writing it into
+        # config.xml means the first cluster-config is already correct.
+        $localDev = $cfg.SelectSingleNode('device')
+        if ($null -eq $localDev) { throw 'no local device element' }
+        $localId = $localDev.GetAttribute('id')
+        $localDev.SetAttribute('name', $DeviceName)
+
+        # Server device: clone the local device (same compression / accept
+        # defaults, address=dynamic) and re-stamp its id + name.
+        $srvDev = $localDev.CloneNode($true)
+        $srvDev.SetAttribute('id', $ServerId)
+        $srvDev.SetAttribute('name', $ServerName)
+        [void]$cfg.AppendChild($srvDev)
+
+        # Two-way vault folder listing this PC + the server. Syncthing fills the
+        # remaining folder defaults (rescan interval, versioning, etc.) on load.
+        $folder = $xml.CreateElement('folder')
+        $folder.SetAttribute('id', $FolderId)
+        $folder.SetAttribute('label', $FolderLabel)
+        $folder.SetAttribute('path', $VaultDir)
+        $folder.SetAttribute('type', 'sendreceive')
+        $folder.SetAttribute('fsWatcherEnabled', 'true')
+        foreach ($devId in @($localId, $ServerId)) {
+            $fd = $xml.CreateElement('device')
+            $fd.SetAttribute('id', $devId)
+            $fd.SetAttribute('introducedBy', '')
+            [void]$fd.AppendChild($xml.CreateElement('encryptionPassword'))
+            [void]$folder.AppendChild($fd)
+        }
+        [void]$cfg.AppendChild($folder)
+
         $xml.Save($CfgPath)
     } catch {
         Fail 'Could not adjust the connection settings.'
@@ -335,9 +373,9 @@ if (-not $script:ApiKey) { Fail "Could not read this PC's private access key." }
 # ---------- 4. start the sync program -------------------------------------------
 Write-Host 'Step 3 of 5: Starting the sync program...'
 if (Get-VaultSyncProcess) {
-    Write-Host '  Already running from an earlier run — keeping it.'
+    Write-Host '  Already running from an earlier run  - keeping it.'
 } else {
-    Start-Process -FilePath $Bin -ArgumentList @('serve', '--home', "`"$StHome`"", '--no-browser', '--no-console') -WindowStyle Hidden
+    Start-Process -FilePath $Bin -ArgumentList @('serve', '--home', "`"$StHome`"", '--no-browser', '--no-console', "--logfile=$AppDir\syncthing.log") -WindowStyle Hidden
 }
 
 # Wait for it to answer locally (up to 60 seconds).
@@ -357,39 +395,18 @@ $MyId = ''
 try { $MyId = (Invoke-StApi -Path '/rest/system/status').myID } catch { }
 if ($MyId -notmatch '^[A-Z0-9]{7}(-[A-Z0-9]{7}){7}$') { Fail "Could not read this PC's pairing code." }
 
-# Name this PC, add the AgentEA server, and set up the vault folder
-# (receive-only: this PC only ever RECEIVES the vault, it cannot change the
-# master copy). Safe to repeat — re-running just re-applies the same thing.
+# The server device and the vault folder were already written into the config
+# BEFORE the program started (see Step 2), so this PC announced the correct
+# cluster-config from its very first connection. Read the folder back and PROVE
+# the server is in its device list -- a sanity check on the pre-start seeding.
 try {
-    Invoke-StApi -Method Patch -Path "/rest/config/devices/$MyId" -Body @{ name = $DeviceName } | Out-Null
+    $check = Invoke-StApi -Path "/rest/config/folders/$FolderId"
+    $ids = @($check.devices | ForEach-Object { $_.deviceID })
+    if (($ids -notcontains $ServerId) -or ($ids -notcontains $MyId)) {
+        Fail "The vault folder was saved without its connections (have: $($ids -join ', '))."
+    }
 } catch {
-    Fail "Could not name this PC's connection."
-}
-try {
-    Invoke-StApi -Method Put -Path "/rest/config/devices/$ServerId" -Body @{
-        deviceID          = $ServerId
-        name              = $ServerName
-        addresses         = @('dynamic')
-        introducer        = $false
-        autoAcceptFolders = $false
-    } | Out-Null
-} catch {
-    Fail 'Could not register the AgentEA server.'
-}
-try {
-    Invoke-StApi -Method Put -Path "/rest/config/folders/$FolderId" -Body @{
-        id               = $FolderId
-        label            = $FolderLabel
-        path             = $VaultDir
-        type             = 'receiveonly'
-        fsWatcherEnabled = $true
-        devices          = @(
-            @{ deviceID = $MyId },
-            @{ deviceID = $ServerId }
-        )
-    } | Out-Null
-} catch {
-    Fail 'Could not set up the vault folder.'
+    Fail 'Could not verify the vault folder setup.'
 }
 
 # ---------- enrol / pairing notice ---------------------------------------------
@@ -402,7 +419,7 @@ if ($Token) {
 } else {
     Write-Host '############################################################'
     Write-Host '#'
-    Write-Host '#   YOUR PAIRING CODE — read it to AgentEA on the call:'
+    Write-Host '#   YOUR PAIRING CODE  - read it to AgentEA on the call:'
     Write-Host '#'
     Write-Host "#   $MyId"
     Write-Host '#'
@@ -416,11 +433,11 @@ Write-Host ''
 if ($Token) {
     $waitStep = 'Step 4 of 5: Connecting to your vault server...'
     $waitHint = 'Connecting to your vault server...'
-    $waitFail = "Could not connect to your vault server yet. It keeps trying in the background — if it doesn't finish shortly, run the installer line again."
+    $waitFail = "Could not connect to your vault server yet. It keeps trying in the background  - if it doesn't finish shortly, run the installer line again."
 } else {
     $waitStep = 'Step 4 of 5: Waiting for AgentEA to approve this computer...'
     $waitHint = 'Waiting for AgentEA to approve this computer... (tell them your pairing code)'
-    $waitFail = 'AgentEA has not approved this computer yet. The connection keeps trying in the background — once they approve, run this installer again to finish up.'
+    $waitFail = 'AgentEA has not approved this computer yet. The connection keeps trying in the background  - once they approve, run this installer again to finish up.'
 }
 Write-Host $waitStep
 $connected = $false
@@ -450,7 +467,7 @@ $elapsed = 0   # the vault transfer gets its own full time budget
 while ($elapsed -lt $WaitTimeout) {
     $resp = $null
     try { $resp = Invoke-StApi -Path "/rest/db/completion?folder=$FolderId" } catch { }
-    # The folder may not be shared back for a few seconds — retry quietly.
+    # The folder may not be shared back for a few seconds  - retry quietly.
     # We also wait for globalBytes > 0: an empty, not-yet-shared folder
     # reports 100% even though nothing has arrived yet.
     if ($resp -and $resp.globalBytes -gt 0) {
@@ -468,9 +485,9 @@ Write-Host ''
 
 if (-not $synced) {
     if ($Token) {
-        Fail 'The vault did not arrive. Your invite may have expired or already been used on another computer — ask AgentEA for a fresh invite, then paste the new line they send you.'
+        Fail 'The vault did not arrive. Your invite may have expired or already been used on another computer  - ask AgentEA for a fresh invite, then paste the new line they send you.'
     }
-    Fail 'The vault is taking longer than expected to arrive. Leave this window open — it keeps trying in the background.'
+    Fail 'The vault is taking longer than expected to arrive. Leave this window open  - it keeps trying in the background.'
 }
 Write-Host "  Your vault has arrived: $VaultDir"
 
@@ -486,14 +503,14 @@ if ($Token) {
 
 # ---------- 6. keep it running after restarts ------------------------------------
 if ($TestMode) {
-    Write-Host "Step 5 of 5: TEST MODE — skipping the automatic startup entry (would create $(Get-StartupShortcutPath))."
+    Write-Host "Step 5 of 5: TEST MODE  - skipping the automatic startup entry (would create $(Get-StartupShortcutPath))."
 } else {
     Write-Host 'Step 5 of 5: Making sync start automatically with this PC...'
     try {
         $shell = New-Object -ComObject WScript.Shell
         $shortcut = $shell.CreateShortcut((Get-StartupShortcutPath))
         $shortcut.TargetPath       = $Bin
-        $shortcut.Arguments        = "serve --home `"$StHome`" --no-browser --no-console"
+        $shortcut.Arguments        = "serve --home `"$StHome`" --no-browser --no-console --logfile=$AppDir\syncthing.log"
         $shortcut.WorkingDirectory = $AppDir
         $shortcut.WindowStyle      = 7   # minimized, stays out of the way
         $shortcut.Description      = 'Keeps your AI Vault in sync (AgentEA)'
@@ -501,7 +518,7 @@ if ($TestMode) {
     } catch {
         Fail 'Could not set sync to start automatically with this PC.'
     }
-    Write-Host '  Done — sync now survives restarts.'
+    Write-Host '  Done  - sync now survives restarts.'
 }
 
 # ---------- 7. open the Claude Desktop extension ----------------------------------
@@ -527,7 +544,7 @@ if ($TestMode) {
 
 Write-Host ''
 Write-Host '============================================================'
-Write-Host '   NEARLY DONE — two clicks left, in the Claude window:'
+Write-Host '   NEARLY DONE  - two clicks left, in the Claude window:'
 Write-Host ''
 Write-Host '   1. Click the Install button.'
 Write-Host '   2. When it asks for your Vault folder, choose:'

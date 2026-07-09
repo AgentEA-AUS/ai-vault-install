@@ -1,8 +1,10 @@
 #!/bin/bash
 #
-# AI Vault installer — AgentEA
-# Sets up a private, receive-only copy of your business vault on this Mac
-# and opens the AI-Vault extension installer for Claude Desktop.
+# AI Vault installer — AgentEA (macOS + Linux)
+# Sets up a private, receive-only copy of your business vault on this computer.
+# On a Mac it also opens the AI-Vault extension installer for Claude Desktop;
+# on Linux it points you at CONNECT.md to wire the vault into your AI tool.
+# (Windows uses install.ps1, the PowerShell sibling of this script.)
 #
 # Usage:
 #   bash install.sh              normal install (run this on the call)
@@ -52,12 +54,34 @@ while [ $# -gt 0 ]; do
     shift 2
 done
 
+# ---------- platform detection ---------------------------------------------
+# One installer, two operating systems. Everything platform-specific below is
+# guarded on $OS; the macOS (Darwin) path is unchanged from the original.
+OS="$(uname -s)"
+case "$OS" in
+    Darwin)
+        NOUN="Mac"
+        ST_OS="macos"; ARCHIVE_EXT="zip"
+        APP_DIR="$HOME/Library/Application Support/AgentEA/AI-Vault"
+        ;;
+    Linux)
+        NOUN="computer"
+        ST_OS="linux"; ARCHIVE_EXT="tar.gz"
+        APP_DIR="$HOME/.local/share/agentea/ai-vault"
+        ;;
+    *)
+        NOUN="computer"; ST_OS=""; ARCHIVE_EXT=""
+        APP_DIR="$HOME/.agentea-ai-vault"
+        ;;
+esac
+
 # ---------- fixed locations & ports ----------------------------------------
-APP_DIR="$HOME/Library/Application Support/AgentEA/AI-Vault"
 GUI_PORT=8385          # local control port (custom, so we never clash with a
 LISTEN_PORT=22001      # normal Syncthing someone may already have installed)
-LAUNCH_LABEL="com.agentea.aivault.syncthing"
+LAUNCH_LABEL="com.agentea.aivault.syncthing"          # macOS LaunchAgent label
 PLIST="$HOME/Library/LaunchAgents/${LAUNCH_LABEL}.plist"
+SYSTEMD_UNIT="agentea-aivault.service"                # Linux systemd --user unit
+SYSTEMD_UNIT_FILE="$HOME/.config/systemd/user/${SYSTEMD_UNIT}"
 HOSTNAME_SHORT="$(hostname -s 2>/dev/null | tr -cd 'A-Za-z0-9-')"
 WAIT_TIMEOUT="${AIVAULT_WAIT_TIMEOUT:-900}"   # seconds to wait for approval/sync
 TEST_MODE=0
@@ -111,13 +135,29 @@ api() {  # api <curl-args...>  — talk to our private sync program
     curl -fsS -m 10 -H "X-API-Key: $API_KEY" "$@" 2>/dev/null
 }
 
+# In-place sed that works on both BSD sed (macOS) and GNU sed (Linux).
+st_sed_inplace() {
+    if [ "$OS" = "Darwin" ]; then sed -i '' "$@"; else sed -i "$@"; fi
+}
+
 # ---------- uninstall -------------------------------------------------------
 if [ "$UNINSTALL" = "1" ]; then
-    echo "Removing AI Vault sync from this Mac..."
-    if [ "$TEST_MODE" = "0" ] && [ -f "$PLIST" ]; then
-        launchctl unload "$PLIST" 2>/dev/null
-        rm -f "$PLIST"
-        echo "  - background sync service removed"
+    echo "Removing AI Vault sync from this $NOUN..."
+    if [ "$TEST_MODE" = "0" ]; then
+        if [ "$OS" = "Darwin" ]; then
+            if [ -f "$PLIST" ]; then
+                launchctl unload "$PLIST" 2>/dev/null
+                rm -f "$PLIST"
+                echo "  - background sync service removed"
+            fi
+        else
+            if [ -f "$SYSTEMD_UNIT_FILE" ]; then
+                systemctl --user disable --now "$SYSTEMD_UNIT" >/dev/null 2>&1
+                rm -f "$SYSTEMD_UNIT_FILE"
+                systemctl --user daemon-reload >/dev/null 2>&1 || true
+                echo "  - background sync service removed"
+            fi
+        fi
     fi
     pkill -f "$ST_HOME" 2>/dev/null && sleep 2
     pkill -9 -f "$ST_HOME" 2>/dev/null
@@ -129,8 +169,10 @@ if [ "$UNINSTALL" = "1" ]; then
         echo "  - test vault folder deleted"
     else
         echo "  - your vault folder was NOT deleted; your files are still in: $VAULT_DIR"
-        echo "  - if the AI Vault extension was added to Claude Desktop, remove it there"
-        echo "    yourself: Claude Desktop > Settings > Extensions > AI Vault > Remove."
+        if [ "$OS" = "Darwin" ]; then
+            echo "  - if the AI Vault extension was added to Claude Desktop, remove it there"
+            echo "    yourself: Claude Desktop > Settings > Extensions > AI Vault > Remove."
+        fi
     fi
     echo "Done."
     exit 0
@@ -140,7 +182,7 @@ fi
 echo ""
 echo "============================================================"
 echo "   AI VAULT SETUP  —  AgentEA"
-echo "   We are going to connect this Mac to your business vault."
+echo "   We are going to connect this $NOUN to your business vault."
 echo "   This takes about 5 minutes. Leave this window open."
 echo "============================================================"
 echo ""
@@ -149,19 +191,27 @@ if [ "$TEST_MODE" = "1" ]; then
     echo ""
 fi
 
-[ "$(uname -s)" = "Darwin" ] || die "This installer only works on a Mac."
-command -v curl >/dev/null 2>&1 || die "This Mac is missing a standard tool (curl) that should always be there."
-if [ ! -d "/Applications/Claude.app" ]; then
-    echo "  NOTE: The Claude app is not installed yet. Setup will still work,"
-    echo "  but you will need Claude Desktop (claude.ai/download) for the last step."
-    echo ""
+case "$OS" in
+    Darwin|Linux) : ;;
+    *) die "This installer works on a Mac or a Linux computer only." ;;
+esac
+command -v curl >/dev/null 2>&1 || die "This $NOUN is missing a standard tool (curl) that should always be there."
+if [ "$OS" = "Darwin" ]; then
+    if [ ! -d "/Applications/Claude.app" ]; then
+        echo "  NOTE: The Claude app is not installed yet. Setup will still work,"
+        echo "  but you will need Claude Desktop (claude.ai/download) for the last step."
+        echo ""
+    fi
+else
+    command -v tar >/dev/null 2>&1 || die "This computer is missing a standard tool (tar) that should always be there."
 fi
 
 # ---------- 2. download the sync program ------------------------------------
 case "$(uname -m)" in
-    arm64)  ARCH="arm64" ;;
-    x86_64) ARCH="amd64" ;;
-    *)      die "This Mac has an unusual processor type ($(uname -m))." ;;
+    arm64)   ARCH="arm64" ;;
+    x86_64)  ARCH="amd64" ;;
+    aarch64) ARCH="arm64" ;;
+    *)       die "This $NOUN has an unusual processor type ($(uname -m))." ;;
 esac
 
 # Never sync into a folder that already holds unrelated files. A folder from
@@ -178,26 +228,36 @@ if [ -x "$BIN" ]; then
     echo "Step 1 of 5: Sync program already downloaded — skipping."
 else
     echo "Step 1 of 5: Downloading the sync program (about 11 MB)..."
-    RELEASE_JSON="$(curl -fsSL -m 60 "https://api.github.com/repos/syncthing/syncthing/releases/latest")" \
-        || die "Could not reach the download site. Check this Mac is online, then run the installer again."
+    RELEASE_JSON="$(curl -fsSL -m 60 ${AIVAULT_GH_TOKEN:+-H "Authorization: Bearer $AIVAULT_GH_TOKEN"} "https://api.github.com/repos/syncthing/syncthing/releases/latest")" \
+        || die "Could not reach the download site. Check this $NOUN is online, then run the installer again."
     ASSET_URL="$(printf '%s' "$RELEASE_JSON" \
         | grep -o '"browser_download_url": *"[^"]*"' \
         | sed 's/.*"\(https:[^"]*\)"/\1/' \
-        | grep "syncthing-macos-${ARCH}-" | head -1)"
-    [ -n "$ASSET_URL" ] || die "Could not find the right download for this Mac."
+        | grep "syncthing-${ST_OS}-${ARCH}-" | head -1)"
+    [ -n "$ASSET_URL" ] || die "Could not find the right download for this $NOUN."
 
     DL_TMP="$(mktemp -d)"
-    curl -fsSL -m 300 -o "$DL_TMP/syncthing.zip" "$ASSET_URL" \
-        || { rm -rf "$DL_TMP"; die "The download failed part-way. Check this Mac is online, then run the installer again."; }
-    unzip -q -o "$DL_TMP/syncthing.zip" -d "$DL_TMP/unpacked" \
-        || { rm -rf "$DL_TMP"; die "The downloaded file would not open."; }
-    FOUND_BIN="$(find "$DL_TMP/unpacked" -type f -name syncthing | head -1)"
+    curl -fsSL -m 300 -o "$DL_TMP/syncthing.${ARCHIVE_EXT}" "$ASSET_URL" \
+        || { rm -rf "$DL_TMP"; die "The download failed part-way. Check this $NOUN is online, then run the installer again."; }
+    if [ "$OS" = "Darwin" ]; then
+        unzip -q -o "$DL_TMP/syncthing.${ARCHIVE_EXT}" -d "$DL_TMP/unpacked" \
+            || { rm -rf "$DL_TMP"; die "The downloaded file would not open."; }
+    else
+        mkdir -p "$DL_TMP/unpacked"
+        tar -xzf "$DL_TMP/syncthing.${ARCHIVE_EXT}" -C "$DL_TMP/unpacked" \
+            || { rm -rf "$DL_TMP"; die "The downloaded file would not open."; }
+    fi
+    # The Linux tarball also ships small init SCRIPTS named "syncthing" --
+    # the real program is the only file over 1MB.
+    FOUND_BIN="$(find "$DL_TMP/unpacked" -type f -name syncthing -size +1M | head -1)"
     [ -n "$FOUND_BIN" ] || { rm -rf "$DL_TMP"; die "The download did not contain the sync program."; }
     mv "$FOUND_BIN" "$BIN"
     chmod +x "$BIN"
     rm -rf "$DL_TMP"
-    # Tell macOS this downloaded program is OK to run (ignore if already OK).
-    xattr -d com.apple.quarantine "$BIN" 2>/dev/null || true
+    if [ "$OS" = "Darwin" ]; then
+        # Tell macOS this downloaded program is OK to run (ignore if already OK).
+        xattr -d com.apple.quarantine "$BIN" 2>/dev/null || true
+    fi
     echo "  Downloaded."
 fi
 
@@ -206,7 +266,7 @@ echo "Step 2 of 5: Setting up this Mac's private connection..."
 if [ -f "$ST_HOME/config.xml" ] && [ -f "$ST_HOME/cert.pem" ]; then
     echo "  Already set up from an earlier run — keeping it."
 else
-    "$BIN" generate --home "$ST_HOME" >/dev/null 2>&1 \
+    "$BIN" generate --home "$ST_HOME" > "$APP_DIR/generate.log" 2>&1 \
         || die "Could not create this Mac's private connection files."
     CFG="$ST_HOME/config.xml"
     [ -f "$CFG" ] || die "The connection settings file was not created."
@@ -216,7 +276,7 @@ else
     # of Syncthing already on this Mac). Note: "generate" picks random
     # ports if the defaults are busy, so these edits must replace whatever
     # value is there, not assume the default.
-    sed -i '' \
+    st_sed_inplace \
         -e "/<gui /,/<\/gui>/ s|<address>[^<]*</address>|<address>127.0.0.1:$GUI_PORT</address>|" \
         -e "s|<localAnnounceEnabled>[^<]*</localAnnounceEnabled>|<localAnnounceEnabled>false</localAnnounceEnabled>|" \
         -e "s|<urAccepted>[^<]*</urAccepted>|<urAccepted>-1</urAccepted>|" \
@@ -248,6 +308,41 @@ else
         skip && /<\/folder>/ {skip=0; next}
         !skip {print}
     ' "$CFG" > "$CFG.tmp" && mv "$CFG.tmp" "$CFG"
+
+    # Seed the WHOLE connection structure into the config BEFORE first start:
+    # the local device's announced name, the AgentEA server device, and the
+    # two-way vault folder listing both devices. This is the Windows fix — a
+    # Windows client would not adopt a folder/device injected over REST *after*
+    # start into its live cluster-config, so it announced the folder without the
+    # server device and the server kept dropping it. Writing it into config.xml
+    # means the very first cluster-config is already correct on every OS.
+    # (The local device id is only known once "generate" has written it, so we
+    # read it back out of the freshly generated config.)
+    LOCAL_ID="$(grep -oE '[A-Z0-9]{7}(-[A-Z0-9]{7}){7}' "$CFG" | head -1)"
+    [ -n "$LOCAL_ID" ] || die "Could not read this $NOUN's connection id."
+    awk -v localid="$LOCAL_ID" -v serverid="$SERVER_DEVICE_ID" \
+        -v servername="$SERVER_NAME" -v devname="$DEVICE_NAME" \
+        -v fid="$FOLDER_ID" -v flabel="$FOLDER_LABEL" -v fpath="$VAULT_DIR" '
+        # Name the local device (its is the only <device> line with a name= attr).
+        !named && /<device id=/ && /name=/ {
+            sub(/name="[^"]*"/, "name=\"" devname "\""); named=1; print; next
+        }
+        # Inject the server device + the vault folder just before the close tag.
+        /<\/configuration>/ {
+            print "    <device id=\"" serverid "\" name=\"" servername "\" compression=\"metadata\" introducer=\"false\" skipIntroductionRemovals=\"false\" introducedBy=\"\">"
+            print "        <address>dynamic</address>"
+            print "        <paused>false</paused>"
+            print "        <autoAcceptFolders>false</autoAcceptFolders>"
+            print "    </device>"
+            print "    <folder id=\"" fid "\" label=\"" flabel "\" path=\"" fpath "\" type=\"sendreceive\" fsWatcherEnabled=\"true\">"
+            print "        <device id=\"" localid "\" introducedBy=\"\"><encryptionPassword></encryptionPassword></device>"
+            print "        <device id=\"" serverid "\" introducedBy=\"\"><encryptionPassword></encryptionPassword></device>"
+            print "    </folder>"
+            print; next
+        }
+        { print }
+    ' "$CFG" > "$CFG.tmp" && mv "$CFG.tmp" "$CFG" \
+        || die "Could not seed the vault connection settings."
 fi
 
 API_KEY="$(sed -n 's/.*<apikey>\(.*\)<\/apikey>.*/\1/p' "$ST_HOME/config.xml" | head -1)"
@@ -275,23 +370,13 @@ MY_ID="$(api "$API_URL/rest/system/status" | grep -o '"myID"[^,]*' | sed 's/.*"\
 echo "$MY_ID" | grep -Eq '^[A-Z0-9]{7}(-[A-Z0-9]{7}){7}$' \
     || die "Could not read this Mac's pairing code."
 
-# Name this Mac, add the AgentEA server, and set up the vault folder
-# (receive-only: this Mac only ever RECEIVES the vault, it cannot change
-# the master copy). Safe to repeat — re-running just re-applies the same thing.
-api -X PATCH -H "Content-Type: application/json" \
-    -d "{\"name\":\"$DEVICE_NAME\"}" \
-    "$API_URL/rest/config/devices/$MY_ID" >/dev/null \
-    || die "Could not name this Mac's connection."
-
-api -X PUT -H "Content-Type: application/json" \
-    -d "{\"deviceID\":\"$SERVER_DEVICE_ID\",\"name\":\"$SERVER_NAME\",\"addresses\":[\"dynamic\"],\"introducer\":false,\"autoAcceptFolders\":false}" \
-    "$API_URL/rest/config/devices/$SERVER_DEVICE_ID" >/dev/null \
-    || die "Could not register the AgentEA server."
-
-api -X PUT -H "Content-Type: application/json" \
-    -d "{\"id\":\"$FOLDER_ID\",\"label\":\"$FOLDER_LABEL\",\"path\":\"$VAULT_DIR\",\"type\":\"receiveonly\",\"fsWatcherEnabled\":true,\"devices\":[{\"deviceID\":\"$MY_ID\"},{\"deviceID\":\"$SERVER_DEVICE_ID\"}]}" \
-    "$API_URL/rest/config/folders/$FOLDER_ID" >/dev/null \
-    || die "Could not set up the vault folder."
+# The server device and the vault folder were already written into the config
+# BEFORE the program started (see Step 2), so this $NOUN announced the correct
+# cluster-config from its very first connection. Read the folder back and PROVE
+# both devices are in its list — a sanity check on the pre-start seeding.
+FCHECK="$(api "$API_URL/rest/config/folders/$FOLDER_ID" | tr -d ' \n\t')"
+printf '%s' "$FCHECK" | grep -q "$SERVER_DEVICE_ID" && printf '%s' "$FCHECK" | grep -q "$MY_ID" \
+    || die "The vault folder was saved without its connections."
 
 # ---------- enrol / pairing notice -------------------------------------------
 echo ""
@@ -384,8 +469,12 @@ fi
 
 # ---------- 6. keep it running after restarts --------------------------------
 if [ "$TEST_MODE" = "1" ]; then
-    echo "Step 5 of 5: TEST MODE — skipping the always-on service (would install $PLIST)."
-else
+    if [ "$OS" = "Darwin" ]; then
+        echo "Step 5 of 5: TEST MODE — skipping the always-on service (would install $PLIST)."
+    else
+        echo "Step 5 of 5: TEST MODE — skipping the always-on service (would install $SYSTEMD_UNIT_FILE)."
+    fi
+elif [ "$OS" = "Darwin" ]; then
     echo "Step 5 of 5: Making sync start automatically with this Mac..."
     mkdir -p "$HOME/Library/LaunchAgents"
     cat > "$PLIST" <<PLIST_EOF
@@ -417,40 +506,96 @@ PLIST_EOF
     launchctl unload "$PLIST" 2>/dev/null
     launchctl load "$PLIST" || die "Could not switch sync on permanently."
     echo "  Done — sync now survives restarts."
-fi
+else
+    # Linux: register a per-user systemd service so sync starts on login/boot.
+    echo "Step 5 of 5: Making sync start automatically with this computer..."
+    mkdir -p "$(dirname "$SYSTEMD_UNIT_FILE")"
+    cat > "$SYSTEMD_UNIT_FILE" <<UNIT_EOF
+[Unit]
+Description=AgentEA AI Vault sync
+After=network-online.target
 
-# ---------- 7. open the Claude Desktop extension ------------------------------
-# From a zip, the extension sits next to this script. From a one-line curl
-# invite there are no adjacent files, so we fetch it from --mcpb-url instead.
-SCRIPT_DIR="$(cd "$(dirname "$0")" 2>/dev/null && pwd)"
-MCPB="${SCRIPT_DIR:-}/AI-Vault.mcpb"
-echo ""
-if [ ! -f "$MCPB" ] && [ -n "$MCPB_URL" ]; then
-    echo "Fetching the Claude extension..."
-    MCPB_TMP="$(mktemp -d)/AI-Vault.mcpb"
-    if curl -fsSL -m 120 -o "$MCPB_TMP" "$MCPB_URL"; then
-        MCPB="$MCPB_TMP"
-        xattr -d com.apple.quarantine "$MCPB" 2>/dev/null || true
+[Service]
+ExecStart=$BIN serve --home $ST_HOME --no-browser
+Restart=on-failure
+
+[Install]
+WantedBy=default.target
+UNIT_EOF
+    SYSTEMD_OK=0
+    if systemctl --user daemon-reload >/dev/null 2>&1; then
+        # Hand the temporary process over to systemd (same home/ports).
+        pkill -f "$ST_HOME" 2>/dev/null
+        sleep 2
+        if systemctl --user enable --now "$SYSTEMD_UNIT" >/dev/null 2>&1; then
+            SYSTEMD_OK=1
+        fi
+    fi
+    if [ "$SYSTEMD_OK" = "1" ]; then
+        echo "  Done — sync now survives restarts."
     else
-        echo "  Could not download the extension automatically — we can add it by hand at the end."
+        # No systemd user bus (some servers/CI): keep the plain background
+        # process running so sync still works for this session.
+        rm -f "$SYSTEMD_UNIT_FILE"
+        if ! pgrep -f "$ST_HOME" >/dev/null 2>&1; then
+            nohup "$BIN" serve --home "$ST_HOME" --no-browser >> "$LOG" 2>&1 &
+        fi
+        echo "  NOTE: this computer has no systemd user session, so sync can't be set"
+        echo "  to start automatically. It is running now and will keep going until you"
+        echo "  restart; after a restart, run this installer line again to resume."
     fi
 fi
-if [ "$TEST_MODE" = "1" ]; then
-    echo "TEST MODE: would now open $MCPB in Claude Desktop's install window."
-else
-    [ -f "$MCPB" ] || die "The AI-Vault extension file is missing from this download."
-    open "$MCPB" || die "Could not open the AI-Vault extension. Is Claude Desktop installed?"
-fi
 
-echo ""
-echo "============================================================"
-echo "   NEARLY DONE — two clicks left, in the Claude window:"
-echo ""
-echo "   1. Click the Install button."
-echo "   2. When it asks for your Vault folder, choose:"
-echo "      $VAULT_DIR"
-echo ""
-echo "   Then ask Claude your first question, for example:"
-echo "   \"What do you know about my business?\""
-echo "============================================================"
-echo ""
+if [ "$OS" = "Darwin" ]; then
+    # ---------- 7. open the Claude Desktop extension --------------------------
+    # From a zip, the extension sits next to this script. From a one-line curl
+    # invite there are no adjacent files, so we fetch it from --mcpb-url instead.
+    SCRIPT_DIR="$(cd "$(dirname "$0")" 2>/dev/null && pwd)"
+    MCPB="${SCRIPT_DIR:-}/AI-Vault.mcpb"
+    echo ""
+    if [ ! -f "$MCPB" ] && [ -n "$MCPB_URL" ]; then
+        echo "Fetching the Claude extension..."
+        MCPB_TMP="$(mktemp -d)/AI-Vault.mcpb"
+        if curl -fsSL -m 120 -o "$MCPB_TMP" "$MCPB_URL"; then
+            MCPB="$MCPB_TMP"
+            xattr -d com.apple.quarantine "$MCPB" 2>/dev/null || true
+        else
+            echo "  Could not download the extension automatically — we can add it by hand at the end."
+        fi
+    fi
+    if [ "$TEST_MODE" = "1" ]; then
+        echo "TEST MODE: would now open $MCPB in Claude Desktop's install window."
+    else
+        [ -f "$MCPB" ] || die "The AI-Vault extension file is missing from this download."
+        open "$MCPB" || die "Could not open the AI-Vault extension. Is Claude Desktop installed?"
+    fi
+
+    echo ""
+    echo "============================================================"
+    echo "   NEARLY DONE — two clicks left, in the Claude window:"
+    echo ""
+    echo "   1. Click the Install button."
+    echo "   2. When it asks for your Vault folder, choose:"
+    echo "      $VAULT_DIR"
+    echo ""
+    echo "   Then ask Claude your first question, for example:"
+    echo "   \"What do you know about my business?\""
+    echo "============================================================"
+    echo ""
+else
+    # ---------- 7. Linux: no Claude Desktop -----------------------------------
+    # Claude Desktop (and its AI-Vault extension) is Mac/Windows only. On Linux
+    # the vault is on disk; point the person's AI tool at it via the MCP server.
+    echo ""
+    echo "============================================================"
+    echo "   DONE — your vault is on this computer:"
+    echo ""
+    echo "   $VAULT_DIR"
+    echo ""
+    echo "   Claude Desktop (Mac/Windows) uses the AI-Vault extension to read"
+    echo "   this folder. On Linux, wire the vault MCP server into your AI tool"
+    echo "   (Codex CLI etc.) — see CONNECT.md in the download repo:"
+    echo "   https://github.com/AgentEA-AUS/ai-vault-install"
+    echo "============================================================"
+    echo ""
+fi
