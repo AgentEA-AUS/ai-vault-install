@@ -544,13 +544,18 @@ if ($TestMode) {
 
 Write-Host ''
 Write-Host '============================================================'
-Write-Host '   NEARLY DONE  - two clicks left, in the Claude window:'
+Write-Host '   ALMOST DONE  - two clicks in the Claude window that just'
+Write-Host '   opened:'
 Write-Host ''
-Write-Host '   1. Click the Install button.'
-Write-Host '   2. When it asks for your Vault folder, choose:'
-Write-Host "      $VaultDir"
+Write-Host '   1. Click the blue  Install  button.'
+Write-Host '   2. It asks for your Vault folder. Paste this into the'
+Write-Host '      "Folder name" box, then click Select:'
 Write-Host ''
-Write-Host '   Then ask Claude your first question, for example:'
-Write-Host '   "What do you know about my business?"'
+Write-Host "        $VaultDir"
+Write-Host ''
+Write-Host '   Done. Ask Claude a question about your business, e.g.'
+Write-Host '   "How do we complete the monthly statement?"'
 Write-Host '============================================================'
 Write-Host ''
+# Open the vault folder so it is easy to find if they prefer to browse.
+if (-not $TestMode) { try { Start-Process explorer.exe $VaultDir } catch { } }

@@ -570,16 +570,20 @@ if [ "$OS" = "Darwin" ]; then
         open "$MCPB" || die "Could not open the AI-Vault extension. Is Claude Desktop installed?"
     fi
 
+    # Open the vault folder so it's easy to find if they prefer to browse.
+    open "$VAULT_DIR" 2>/dev/null || true
     echo ""
     echo "============================================================"
-    echo "   NEARLY DONE — two clicks left, in the Claude window:"
+    echo "   ALMOST DONE — two clicks in the Claude window that just opened:"
     echo ""
-    echo "   1. Click the Install button."
-    echo "   2. When it asks for your Vault folder, choose:"
-    echo "      $VAULT_DIR"
+    echo "   1. Click the blue  Install  button."
+    echo "   2. It asks for your Vault folder. Paste this into the box,"
+    echo "      then click Open:"
     echo ""
-    echo "   Then ask Claude your first question, for example:"
-    echo "   \"What do you know about my business?\""
+    echo "        $VAULT_DIR"
+    echo ""
+    echo "   Done. Ask Claude a question about your business, e.g."
+    echo "   \"How do we complete the monthly statement?\""
     echo "============================================================"
     echo ""
 else
