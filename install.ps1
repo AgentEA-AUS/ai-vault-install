@@ -1,15 +1,17 @@
 ﻿# AI Vault installer  - AgentEA (Windows)
-# Sets up a private, receive-only copy of your business vault on this PC and
-# opens the AI-Vault extension installer for Claude Desktop.
+# Sets up a private, receive-only copy of your business vault on this PC, then
+# auto-wires it into Claude Desktop and/or Codex with a standalone connector
+# binary  - no folder picker, no .mcpb, no Codex setup by hand.
 #
 # Works on stock Windows 10/11 PowerShell 5.1  - no admin rights needed anywhere.
 #
 # Usage (normal install  - usually pasted as one invite line):
 #   powershell -ExecutionPolicy Bypass -File install.ps1
 #   powershell -ExecutionPolicy Bypass -File install.ps1 -ServerId <ID> -FolderId <ID> `
-#       -Label <person> -Token <TOKEN> [-ClientPrefix <p>] [-McpbUrl <URL>]
+#       -Label <person> -Token <TOKEN> [-ClientPrefix <p>] [-ConnectorUrlBase <URL>]
 #   With -Token the computer enrolls automatically (no pairing code to read).
 #   Without -Token the classic pairing-code flow runs (the manual fallback).
+#   (-McpbUrl is still accepted for old invite lines but is now ignored.)
 #
 # Remove it again (keeps your vault folder):
 #   powershell -ExecutionPolicy Bypass -File install.ps1 -Uninstall
@@ -21,7 +23,9 @@ param(
     [string]$Label        = "",
     [string]$Token        = "",
     [string]$ClientPrefix = "tb",
-    [string]$McpbUrl      = "",
+    # Where the standalone connector binaries are published; override if hosted elsewhere.
+    [string]$ConnectorUrlBase = "https://github.com/AgentEA-AUS/ai-vault-install/releases/download/connector-v0.2.0",
+    [string]$McpbUrl      = "",   # legacy no-op: accepted so old invite lines still run
     [switch]$Uninstall
 )
 $ServerName  = "AgentEA Vault Server"
@@ -67,6 +71,16 @@ $Bin     = Join-Path $BinDir 'syncthing.exe'
 $StHome  = Join-Path $AppDir 'syncthing-home'
 $CfgPath = Join-Path $StHome 'config.xml'
 $ApiUrl  = "http://127.0.0.1:$GuiPort"
+
+# The standalone vault connector we download and wire into the AI apps, and
+# where Claude Desktop keeps its list of MCP servers. In TEST MODE the Claude
+# config is a throwaway file so we never touch the real one.
+$Connector = Join-Path $BinDir 'vault-connector.exe'
+if ($TestMode) {
+    $ClaudeConfig = Join-Path $env:AIVAULT_TEST_DIR 'claude_desktop_config.json'
+} else {
+    $ClaudeConfig = Join-Path $env:APPDATA 'Claude\claude_desktop_config.json'
+}
 
 # ---------- work out this computer's name on the server ----------------------
 # With a token, the device announces itself as enroll:<token>:<base> so the
@@ -134,6 +148,85 @@ function Get-StartupShortcutPath {
     Join-Path ([Environment]::GetFolderPath('Startup')) $ShortcutName
 }
 
+function Write-JsonFileNoBom {
+    # Atomic, UTF-8 without BOM (Claude Desktop's JSON parser rejects a BOM).
+    param([string]$Path, [string]$Json)
+    $dir = Split-Path -Parent $Path
+    if ($dir -and -not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+    $tmp = "$Path.tmp.$PID"
+    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::WriteAllText($tmp, $Json, $utf8NoBom)
+    Move-Item -Path $tmp -Destination $Path -Force
+}
+
+function Merge-ClaudeConfig {
+    # Set our one MCP entry, preserving every other key and every other server.
+    param([string]$ConfigPath, [string]$Command, [string]$Vault)
+    $root = $null
+    if (Test-Path $ConfigPath) {
+        try { $root = Get-Content -Raw -Path $ConfigPath | ConvertFrom-Json } catch { $root = $null }
+    }
+    if ($null -eq $root) { $root = New-Object PSObject }
+    $servers = $null
+    if ($root.PSObject.Properties.Name -contains 'mcpServers') { $servers = $root.mcpServers }
+    if ($null -eq $servers) { $servers = New-Object PSObject }
+    $entry = [PSCustomObject]@{ command = $Command; args = @($Vault) }
+    $servers | Add-Member -NotePropertyName 'business_vault' -NotePropertyValue $entry -Force
+    $root | Add-Member -NotePropertyName 'mcpServers' -NotePropertyValue $servers -Force
+    Write-JsonFileNoBom -Path $ConfigPath -Json ($root | ConvertTo-Json -Depth 10)
+}
+
+function Remove-ClaudeEntry {
+    # Remove only our entry, leaving everything else untouched.
+    param([string]$ConfigPath)
+    if (-not (Test-Path $ConfigPath)) { return }
+    try { $root = Get-Content -Raw -Path $ConfigPath | ConvertFrom-Json } catch { return }
+    if ($null -eq $root) { return }
+    if (($root.PSObject.Properties.Name -contains 'mcpServers') -and $root.mcpServers) {
+        if ($root.mcpServers.PSObject.Properties.Name -contains 'business_vault') {
+            $root.mcpServers.PSObject.Properties.Remove('business_vault')
+        }
+    }
+    Write-JsonFileNoBom -Path $ConfigPath -Json ($root | ConvertTo-Json -Depth 10)
+}
+
+function Test-Connector {
+    # Prove the downloaded binary is really our connector: non-empty AND it
+    # answers an MCP "initialize" request over stdio.
+    param([string]$Exe, [string]$Vault)
+    if (-not (Test-Path $Exe)) { return $false }
+    if ((Get-Item $Exe).Length -le 0) { return $false }
+    try {
+        $psi = New-Object System.Diagnostics.ProcessStartInfo
+        $psi.FileName               = $Exe
+        $psi.Arguments              = "`"$Vault`""
+        $psi.RedirectStandardInput  = $true
+        $psi.RedirectStandardOutput = $true
+        $psi.RedirectStandardError  = $true
+        $psi.UseShellExecute        = $false
+        $psi.CreateNoWindow         = $true
+        $p = [System.Diagnostics.Process]::Start($psi)
+        $init = '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"install","version":"0"}}}'
+        $p.StandardInput.WriteLine($init)
+        $p.StandardInput.Flush()
+        # First launch of a large unsigned exe can be slow (Windows Defender scans
+        # it on execution), so wait generously for the initialize reply.
+        $readTask = $p.StandardOutput.ReadLineAsync()
+        $line = ''
+        if ($readTask.Wait(30000)) { $line = $readTask.Result }
+        $alive = -not $p.HasExited
+        try { $p.Kill() } catch { }
+        try { $p.StandardInput.Close() } catch { }
+        # Pass if it answered the MCP handshake OR (fallback) it spawned and was
+        # still running  - a healthy MCP server waiting on stdio. Only a binary
+        # that crashed on launch exits early, and that is what we reject.
+        if ($line -match '"jsonrpc"') { return $true }
+        return $alive
+    } catch {
+        return $false
+    }
+}
+
 # ---------- uninstall --------------------------------------------------------
 if ($Uninstall) {
     Write-Host 'Removing AI Vault sync from this PC...'
@@ -144,6 +237,22 @@ if ($Uninstall) {
     }
     Stop-VaultSyncProcess
     Write-Host '  - sync program stopped'
+
+    # Un-wire the AI apps: drop just our entry from Claude Desktop's config and,
+    # if Codex is here, remove its vault MCP server. Both leave everything else
+    # untouched and are no-ops when absent.
+    if ($ClaudeConfig -and (Test-Path $ClaudeConfig)) {
+        try { Remove-ClaudeEntry -ConfigPath $ClaudeConfig; Write-Host '  - vault removed from Claude Desktop' } catch { }
+    }
+    $codexCmd = Get-Command codex -ErrorAction SilentlyContinue
+    if ($codexCmd) {
+        if ($TestMode) { $codexHome = Join-Path $env:AIVAULT_TEST_DIR 'codex' } else { $codexHome = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $env:USERPROFILE '.codex' } }
+        $prevCodexHome = $env:CODEX_HOME
+        $env:CODEX_HOME = $codexHome
+        try { & codex mcp remove business_vault *> $null; if (-not $TestMode) { Write-Host '  - vault removed from Codex' } } catch { }
+        $env:CODEX_HOME = $prevCodexHome
+    }
+
     if (Test-Path $AppDir) {
         Remove-Item $AppDir -Recurse -Force -ErrorAction SilentlyContinue
     }
@@ -153,8 +262,6 @@ if ($Uninstall) {
         Write-Host '  - test vault folder deleted'
     } else {
         Write-Host "  - your vault folder was NOT deleted; your files are still in: $VaultDir"
-        Write-Host '  - if the AI Vault extension was added to Claude Desktop, remove it there'
-        Write-Host '    yourself: Claude Desktop > Settings > Extensions > AI Vault > Remove.'
     }
     Write-Host 'Done.'
     exit 0
@@ -219,9 +326,9 @@ New-Item -ItemType Directory -Path $BinDir -Force | Out-Null
 New-Item -ItemType Directory -Path $VaultDir -Force | Out-Null
 
 if (Test-Path $Bin) {
-    Write-Host 'Step 1 of 5: Sync program already downloaded  - skipping.'
+    Write-Host 'Step 1 of 6: Sync program already downloaded  - skipping.'
 } else {
-    Write-Host 'Step 1 of 5: Downloading the sync program (about 11 MB)...'
+    Write-Host 'Step 1 of 6: Downloading the sync program (about 11 MB)...'
     try {
         $relHeaders = @{}
         if ($env:AIVAULT_GH_TOKEN) { $relHeaders['Authorization'] = "Bearer $($env:AIVAULT_GH_TOKEN)" }
@@ -260,7 +367,7 @@ if (Test-Path $Bin) {
 }
 
 # ---------- 3. create this PC's private identity + settings --------------------
-Write-Host "Step 2 of 5: Setting up this PC's private connection..."
+Write-Host "Step 2 of 6: Setting up this PC's private connection..."
 if ((Test-Path $CfgPath) -and (Test-Path (Join-Path $StHome 'cert.pem'))) {
     Write-Host '  Already set up from an earlier run  - keeping it.'
 } else {
@@ -371,7 +478,7 @@ try {
 if (-not $script:ApiKey) { Fail "Could not read this PC's private access key." }
 
 # ---------- 4. start the sync program -------------------------------------------
-Write-Host 'Step 3 of 5: Starting the sync program...'
+Write-Host 'Step 3 of 6: Starting the sync program...'
 if (Get-VaultSyncProcess) {
     Write-Host '  Already running from an earlier run  - keeping it.'
 } else {
@@ -431,11 +538,11 @@ Write-Host ''
 # With a token the server approves us on its own, so the honest wording is
 # "connecting". Without one, a human is approving the pairing code by hand.
 if ($Token) {
-    $waitStep = 'Step 4 of 5: Connecting to your vault server...'
+    $waitStep = 'Step 4 of 6: Connecting to your vault server...'
     $waitHint = 'Connecting to your vault server...'
     $waitFail = "Could not connect to your vault server yet. It keeps trying in the background  - if it doesn't finish shortly, run the installer line again."
 } else {
-    $waitStep = 'Step 4 of 5: Waiting for AgentEA to approve this computer...'
+    $waitStep = 'Step 4 of 6: Waiting for AgentEA to approve this computer...'
     $waitHint = 'Waiting for AgentEA to approve this computer... (tell them your pairing code)'
     $waitFail = 'AgentEA has not approved this computer yet. The connection keeps trying in the background  - once they approve, run this installer again to finish up.'
 }
@@ -503,9 +610,9 @@ if ($Token) {
 
 # ---------- 6. keep it running after restarts ------------------------------------
 if ($TestMode) {
-    Write-Host "Step 5 of 5: TEST MODE  - skipping the automatic startup entry (would create $(Get-StartupShortcutPath))."
+    Write-Host "Step 5 of 6: TEST MODE  - skipping the automatic startup entry (would create $(Get-StartupShortcutPath))."
 } else {
-    Write-Host 'Step 5 of 5: Making sync start automatically with this PC...'
+    Write-Host 'Step 5 of 6: Making sync start automatically with this PC...'
     try {
         $shell = New-Object -ComObject WScript.Shell
         $shortcut = $shell.CreateShortcut((Get-StartupShortcutPath))
@@ -521,41 +628,124 @@ if ($TestMode) {
     Write-Host '  Done  - sync now survives restarts.'
 }
 
-# ---------- 7. open the Claude Desktop extension ----------------------------------
-if ($TestMode) {
-    Write-Host 'TEST MODE: would now fetch the AI-Vault extension and open it in Claude Desktop.'
-} else {
-    $mcpbPath = Join-Path $env:USERPROFILE 'Downloads\AI-Vault.mcpb'
-    if (-not $McpbUrl) { Fail 'The address of the AI-Vault extension is missing from this invite. Ask AgentEA for a fresh invite line.' }
-    Write-Host ''
-    Write-Host 'Fetching the Claude extension...'
+# ---------- 7. auto-wire the AI apps ----------------------------------------------
+# The vault is on disk; now point Claude Desktop and/or Codex at it with a
+# standalone connector binary  - no folder picker, no .mcpb, no Codex setup.
+Write-Host ''
+Write-Host 'Step 6 of 6: Connecting your vault to Claude / Codex...'
+
+# a) download the right connector binary for this PC's processor, then prove it runs.
+$connArch = if ($Arch -eq 'amd64') { 'x64' } else { 'arm64' }
+$connectorSrc = "$ConnectorUrlBase/vault-connector-windows-$connArch.exe"
+if (-not (Test-Path $Connector)) {
+    Write-Host '  Downloading the vault connector...'
     try {
-        Invoke-WebRequest -Uri $McpbUrl -OutFile $mcpbPath -TimeoutSec 120 -UseBasicParsing
-        try { Unblock-File -Path $mcpbPath } catch { }
+        Invoke-WebRequest -Uri $connectorSrc -OutFile $Connector -TimeoutSec 300 -UseBasicParsing
     } catch {
-        Fail 'Could not download the AI-Vault extension. Check this PC is online, then run the installer line again.'
+        Fail 'Could not download the vault connector. Check this PC is online, then run the installer line again.'
+    }
+    try { Unblock-File -Path $Connector } catch { }
+}
+if (-not (Test-Connector -Exe $Connector -Vault $VaultDir)) {
+    Fail 'The vault connector would not start on this PC. Run the installer line again; if it keeps failing, call AgentEA.'
+}
+
+$wiredClaude = $false
+$wiredCodex  = $false
+
+# b) Claude Desktop  - merge our one entry into its config, never clobbering any
+#    other keys or servers. In TEST MODE the config is a throwaway file.
+$claudePresent = $false
+if ($TestMode) {
+    $claudePresent = $true                        # always exercise the merge in tests
+} elseif (($env:APPDATA -and (Test-Path (Join-Path $env:APPDATA 'Claude'))) `
+          -or ($env:LOCALAPPDATA -and (Test-Path (Join-Path $env:LOCALAPPDATA 'AnthropicClaude')))) {
+    $claudePresent = $true
+}
+if ($claudePresent) {
+    # Back the existing config up once before we ever touch it.
+    if ((Test-Path $ClaudeConfig) -and -not (Test-Path "$ClaudeConfig.agentea-backup")) {
+        Copy-Item -Path $ClaudeConfig -Destination "$ClaudeConfig.agentea-backup" -Force -ErrorAction SilentlyContinue
     }
     try {
-        Start-Process -FilePath $mcpbPath
+        Merge-ClaudeConfig -ConfigPath $ClaudeConfig -Command $Connector -Vault $VaultDir
+        $wiredClaude = $true
+        Write-Host '  Connected to Claude Desktop.'
     } catch {
-        Fail 'Could not open the AI-Vault extension. Is Claude Desktop installed? Get it from claude.ai/download, then double-click AI-Vault.mcpb in your Downloads folder.'
+        Fail "Could not update Claude's settings."
     }
 }
 
-Write-Host ''
-Write-Host '============================================================'
-Write-Host '   ALMOST DONE  - two clicks in the Claude window that just'
-Write-Host '   opened:'
-Write-Host ''
-Write-Host '   1. Click the blue  Install  button.'
-Write-Host '   2. It asks for your Vault folder. Paste this into the'
-Write-Host '      "Folder name" box, then click Select:'
-Write-Host ''
-Write-Host "        $VaultDir"
-Write-Host ''
-Write-Host '   Done. Ask Claude a question about your business, e.g.'
-Write-Host '   "How do we complete the monthly statement?"'
-Write-Host '============================================================'
-Write-Host ''
-# Open the vault folder so it is easy to find if they prefer to browse.
+# c) Codex  - non-interactive, remove-then-add so re-running is idempotent. A
+#    Codex hiccup must never fail the whole install: warn and carry on.
+$codexCmd = Get-Command codex -ErrorAction SilentlyContinue
+if ($codexCmd) {
+    if ($TestMode) { $codexHome = Join-Path $env:AIVAULT_TEST_DIR 'codex' } else { $codexHome = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $env:USERPROFILE '.codex' } }
+    New-Item -ItemType Directory -Path $codexHome -Force | Out-Null
+    $prevCodexHome = $env:CODEX_HOME
+    $env:CODEX_HOME = $codexHome
+    try {
+        & codex mcp remove business_vault *> $null
+        & codex mcp add business_vault '--' $Connector $VaultDir *> $null
+        if ($LASTEXITCODE -eq 0) {
+            $wiredCodex = $true
+            Write-Host '  Connected to Codex.'
+        } else {
+            Write-Host '  NOTE: found Codex but could not wire it automatically  - skipping it.'
+        }
+    } catch {
+        Write-Host '  NOTE: found Codex but could not wire it automatically  - skipping it.'
+    } finally {
+        $env:CODEX_HOME = $prevCodexHome
+    }
+}
+
+# d) Nothing to wire into  - the vault is still synced; re-running wires it.
+if (-not $wiredClaude -and -not $wiredCodex) {
+    if (-not $TestMode) { try { Start-Process explorer.exe $VaultDir } catch { } }
+    Write-Host ''
+    Write-Host '============================================================'
+    Write-Host '   YOUR VAULT IS READY on this PC:'
+    Write-Host ''
+    Write-Host "     $VaultDir"
+    Write-Host ''
+    Write-Host "   We couldn't find Claude or Codex on this computer. Install one"
+    Write-Host '   of them (claude.ai/download or the Codex CLI), then paste this'
+    Write-Host '   same line again  - it will connect the vault automatically.'
+    Write-Host '============================================================'
+    Write-Host ''
+    exit 0
+}
+
+# e) Final message  - name exactly what was wired. If Claude was wired and is
+#    running (and we are not testing), restart it so it picks up the new server.
+$wiredList = @()
+if ($wiredClaude) { $wiredList += 'Claude Desktop' }
+if ($wiredCodex)  { $wiredList += 'Codex' }
+
+if ($wiredClaude -and -not $TestMode) {
+    $claudeProc = Get-Process -Name 'Claude' -ErrorAction SilentlyContinue
+    if ($claudeProc) {
+        $claudeExe = ($claudeProc | Where-Object { $_.Path } | Select-Object -First 1).Path
+        try {
+            $claudeProc | Stop-Process -Force -ErrorAction SilentlyContinue
+            Start-Sleep -Seconds 2
+            if ($claudeExe) { Start-Process -FilePath $claudeExe }
+        } catch { }
+    }
+}
+
 if (-not $TestMode) { try { Start-Process explorer.exe $VaultDir } catch { } }
+Write-Host ''
+Write-Host '============================================================'
+Write-Host '   DONE  - your vault is connected on this PC.'
+Write-Host ''
+Write-Host "   Wired into: $($wiredList -join ' and ')"
+Write-Host "   Your vault: $VaultDir"
+if ($wiredClaude) {
+    Write-Host ''
+    Write-Host '   Close Claude completely and open it again, then ask a question'
+    Write-Host '   about your business, e.g. "How do we complete the monthly statement?"'
+}
+Write-Host '============================================================'
+Write-Host ''

@@ -1,9 +1,9 @@
 #!/bin/bash
 #
 # AI Vault installer — AgentEA (macOS + Linux)
-# Sets up a private, receive-only copy of your business vault on this computer.
-# On a Mac it also opens the AI-Vault extension installer for Claude Desktop;
-# on Linux it points you at CONNECT.md to wire the vault into your AI tool.
+# Sets up a private, receive-only copy of your business vault on this computer,
+# then auto-wires it into Claude Desktop and/or Codex using a standalone
+# connector binary — no folder picker, no .mcpb, no Codex setup by hand.
 # (Windows uses install.ps1, the PowerShell sibling of this script.)
 #
 # Usage:
@@ -13,9 +13,10 @@
 # Self-serve invite mode (flags override the per-client defaults below, so the
 # same script works both from a client zip AND from a one-line curl invite):
 #   bash install.sh --server-id <ID> --folder-id <ID> --label <person> \
-#                   --token <TOKEN> [--client-prefix <p>] [--mcpb-url <URL>]
+#                   --token <TOKEN> [--client-prefix <p>] [--connector-url-base <URL>]
 #   With --token the computer enrolls automatically (no pairing code to read).
 #   Without --token the classic pairing-code flow runs (the manual fallback).
+#   (--mcpb-url is still accepted for old invite lines but is now ignored.)
 #
 # ============ PER-CLIENT SETTINGS (edit before zipping) ====================
 SERVER_DEVICE_ID="N737W2E-EBIAKPP-WSDDOB7-G4G6OHY-6LLOLP4-45OHFSL-NOJ3RVY-HKEZ2QF"
@@ -27,6 +28,10 @@ CLIENT_LABEL_PREFIX="tb"        # device name becomes tb-<hostname>
 # ===========================================================================
 # Nothing below this line is client-specific.
 
+# Where the standalone connector binaries (one per OS/arch) are published.
+# Override with --connector-url-base if you ever host them elsewhere.
+CONNECTOR_URL_BASE="https://github.com/AgentEA-AUS/ai-vault-install/releases/download/connector-v0.2.0"
+
 set -u
 
 # ---------- flags: override the per-client defaults above -------------------
@@ -35,7 +40,7 @@ set -u
 # per-person server id, folder, label and one-time token).
 LABEL=""            # the person, e.g. donna — added into the device name
 TOKEN=""            # one-time enrolment token; when set, auto-enrol (no code)
-MCPB_URL=""         # where to fetch the Claude extension if it's not adjacent
+MCPB_URL=""         # legacy no-op: accepted so old invite lines still run
 UNINSTALL=0
 while [ $# -gt 0 ]; do
     opt="$1"
@@ -48,7 +53,8 @@ while [ $# -gt 0 ]; do
         --label)         LABEL="$val" ;;
         --token)         TOKEN="$val" ;;
         --client-prefix) CLIENT_LABEL_PREFIX="$val" ;;
-        --mcpb-url)      MCPB_URL="$val" ;;
+        --connector-url-base) CONNECTOR_URL_BASE="$val" ;;
+        --mcpb-url)      MCPB_URL="$val" ;;   # legacy: accepted, ignored
         *) echo "Unknown option: $opt" >&2; exit 1 ;;
     esac
     shift 2
@@ -122,6 +128,18 @@ ST_HOME="$APP_DIR/syncthing-home"
 LOG="$APP_DIR/syncthing.log"
 API_URL="http://127.0.0.1:$GUI_PORT"
 
+# The standalone vault connector we download and wire into the AI apps, and
+# where Claude Desktop keeps its list of MCP servers. In TEST MODE the Claude
+# config is a throwaway file so we never touch the real one.
+CONNECTOR="$BIN_DIR/vault-connector"
+if [ "$TEST_MODE" = "1" ]; then
+    CLAUDE_CONFIG="$AIVAULT_TEST_DIR/claude_desktop_config.json"
+elif [ "$OS" = "Darwin" ]; then
+    CLAUDE_CONFIG="$HOME/Library/Application Support/Claude/claude_desktop_config.json"
+else
+    CLAUDE_CONFIG=""          # Linux has no Claude Desktop
+fi
+
 # ---------- helpers ---------------------------------------------------------
 die() {
     echo ""
@@ -138,6 +156,59 @@ api() {  # api <curl-args...>  — talk to our private sync program
 # In-place sed that works on both BSD sed (macOS) and GNU sed (Linux).
 st_sed_inplace() {
     if [ "$OS" = "Darwin" ]; then sed -i '' "$@"; else sed -i "$@"; fi
+}
+
+# Merge our one MCP-server entry into a Claude Desktop config, preserving every
+# other key and every other server. Uses a real JSON parser (python3) and an
+# atomic temp-then-replace write, so the file is never left half-written and is
+# idempotent (re-running just refreshes our entry). Args: <config-path>.
+claude_config_merge() {
+    python3 - "$1" "$CONNECTOR" "$VAULT_DIR" <<'PY'
+import json, os, sys, tempfile
+cfg_path, command, vault = sys.argv[1], sys.argv[2], sys.argv[3]
+data = {}
+if os.path.exists(cfg_path):
+    try:
+        with open(cfg_path) as f:
+            data = json.load(f) or {}
+    except Exception:
+        data = {}
+if not isinstance(data, dict):
+    data = {}
+servers = data.get("mcpServers")
+if not isinstance(servers, dict):
+    servers = {}
+servers["business_vault"] = {"command": command, "args": [vault]}
+data["mcpServers"] = servers
+d = os.path.dirname(cfg_path) or "."
+os.makedirs(d, exist_ok=True)
+fd, tmp = tempfile.mkstemp(dir=d)
+with os.fdopen(fd, "w") as w:
+    json.dump(data, w, indent=2)
+os.replace(tmp, cfg_path)
+PY
+}
+
+# Remove only our entry from a Claude Desktop config, leaving everything else
+# untouched. No-op if the file or the entry is absent. Args: <config-path>.
+claude_config_remove() {
+    [ -f "$1" ] || return 0
+    python3 - "$1" <<'PY'
+import json, os, sys, tempfile
+cfg_path = sys.argv[1]
+try:
+    with open(cfg_path) as f:
+        data = json.load(f)
+except Exception:
+    sys.exit(0)
+if isinstance(data, dict) and isinstance(data.get("mcpServers"), dict):
+    data["mcpServers"].pop("business_vault", None)
+    d = os.path.dirname(cfg_path) or "."
+    fd, tmp = tempfile.mkstemp(dir=d)
+    with os.fdopen(fd, "w") as w:
+        json.dump(data, w, indent=2)
+    os.replace(tmp, cfg_path)
+PY
 }
 
 # ---------- uninstall -------------------------------------------------------
@@ -162,6 +233,22 @@ if [ "$UNINSTALL" = "1" ]; then
     pkill -f "$ST_HOME" 2>/dev/null && sleep 2
     pkill -9 -f "$ST_HOME" 2>/dev/null
     echo "  - sync program stopped"
+
+    # Un-wire the AI apps: drop just our entry from Claude Desktop's config and,
+    # if Codex is here, remove its vault MCP server. Both leave everything else
+    # untouched and are no-ops when absent.
+    if [ -n "$CLAUDE_CONFIG" ] && command -v python3 >/dev/null 2>&1 && [ -f "$CLAUDE_CONFIG" ]; then
+        claude_config_remove "$CLAUDE_CONFIG"
+        echo "  - vault removed from Claude Desktop"
+    fi
+    if command -v codex >/dev/null 2>&1; then
+        if [ "$TEST_MODE" = "1" ]; then
+            CODEX_HOME="$AIVAULT_TEST_DIR/codex" codex mcp remove business_vault >/dev/null 2>&1 || true
+        else
+            codex mcp remove business_vault >/dev/null 2>&1 && echo "  - vault removed from Codex" || true
+        fi
+    fi
+
     rm -rf "$APP_DIR"
     echo "  - program files deleted"
     if [ "$TEST_MODE" = "1" ]; then
@@ -169,10 +256,6 @@ if [ "$UNINSTALL" = "1" ]; then
         echo "  - test vault folder deleted"
     else
         echo "  - your vault folder was NOT deleted; your files are still in: $VAULT_DIR"
-        if [ "$OS" = "Darwin" ]; then
-            echo "  - if the AI Vault extension was added to Claude Desktop, remove it there"
-            echo "    yourself: Claude Desktop > Settings > Extensions > AI Vault > Remove."
-        fi
     fi
     echo "Done."
     exit 0
@@ -225,9 +308,9 @@ fi
 mkdir -p "$BIN_DIR" "$VAULT_DIR"
 
 if [ -x "$BIN" ]; then
-    echo "Step 1 of 5: Sync program already downloaded — skipping."
+    echo "Step 1 of 6: Sync program already downloaded — skipping."
 else
-    echo "Step 1 of 5: Downloading the sync program (about 11 MB)..."
+    echo "Step 1 of 6: Downloading the sync program (about 11 MB)..."
     RELEASE_JSON="$(curl -fsSL -m 60 ${AIVAULT_GH_TOKEN:+-H "Authorization: Bearer $AIVAULT_GH_TOKEN"} "https://api.github.com/repos/syncthing/syncthing/releases/latest")" \
         || die "Could not reach the download site. Check this $NOUN is online, then run the installer again."
     ASSET_URL="$(printf '%s' "$RELEASE_JSON" \
@@ -262,7 +345,7 @@ else
 fi
 
 # ---------- 3. create this Mac's private identity + settings -----------------
-echo "Step 2 of 5: Setting up this Mac's private connection..."
+echo "Step 2 of 6: Setting up this Mac's private connection..."
 if [ -f "$ST_HOME/config.xml" ] && [ -f "$ST_HOME/cert.pem" ]; then
     echo "  Already set up from an earlier run — keeping it."
 else
@@ -349,7 +432,7 @@ API_KEY="$(sed -n 's/.*<apikey>\(.*\)<\/apikey>.*/\1/p' "$ST_HOME/config.xml" | 
 [ -n "$API_KEY" ] || die "Could not read this Mac's private access key."
 
 # ---------- 4. start the sync program ----------------------------------------
-echo "Step 3 of 5: Starting the sync program..."
+echo "Step 3 of 6: Starting the sync program..."
 NOHUP_PID=""
 if pgrep -f "$ST_HOME" >/dev/null 2>&1; then
     echo "  Already running from an earlier run — keeping it."
@@ -400,11 +483,11 @@ echo ""
 # With a token the server approves us on its own, so the honest wording is
 # "connecting". Without one, a human is approving the pairing code by hand.
 if [ -n "$TOKEN" ]; then
-    WAIT_STEP="Step 4 of 5: Connecting to your vault server..."
+    WAIT_STEP="Step 4 of 6: Connecting to your vault server..."
     WAIT_HINT="Connecting to your vault server..."
     WAIT_FAIL="Could not connect to your vault server yet. It keeps trying in the background — if it doesn't finish shortly, run the installer line again."
 else
-    WAIT_STEP="Step 4 of 5: Waiting for AgentEA to approve this computer..."
+    WAIT_STEP="Step 4 of 6: Waiting for AgentEA to approve this computer..."
     WAIT_HINT="Waiting for AgentEA to approve this computer... (tell them your pairing code)"
     WAIT_FAIL="AgentEA has not approved this computer yet. The connection keeps trying in the background — once they approve, run this installer again to finish up."
 fi
@@ -470,12 +553,12 @@ fi
 # ---------- 6. keep it running after restarts --------------------------------
 if [ "$TEST_MODE" = "1" ]; then
     if [ "$OS" = "Darwin" ]; then
-        echo "Step 5 of 5: TEST MODE — skipping the always-on service (would install $PLIST)."
+        echo "Step 5 of 6: TEST MODE — skipping the always-on service (would install $PLIST)."
     else
-        echo "Step 5 of 5: TEST MODE — skipping the always-on service (would install $SYSTEMD_UNIT_FILE)."
+        echo "Step 5 of 6: TEST MODE — skipping the always-on service (would install $SYSTEMD_UNIT_FILE)."
     fi
 elif [ "$OS" = "Darwin" ]; then
-    echo "Step 5 of 5: Making sync start automatically with this Mac..."
+    echo "Step 5 of 6: Making sync start automatically with this Mac..."
     mkdir -p "$HOME/Library/LaunchAgents"
     cat > "$PLIST" <<PLIST_EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -508,7 +591,7 @@ PLIST_EOF
     echo "  Done — sync now survives restarts."
 else
     # Linux: register a per-user systemd service so sync starts on login/boot.
-    echo "Step 5 of 5: Making sync start automatically with this computer..."
+    echo "Step 5 of 6: Making sync start automatically with this computer..."
     mkdir -p "$(dirname "$SYSTEMD_UNIT_FILE")"
     cat > "$SYSTEMD_UNIT_FILE" <<UNIT_EOF
 [Unit]
@@ -546,60 +629,109 @@ UNIT_EOF
     fi
 fi
 
-if [ "$OS" = "Darwin" ]; then
-    # ---------- 7. open the Claude Desktop extension --------------------------
-    # From a zip, the extension sits next to this script. From a one-line curl
-    # invite there are no adjacent files, so we fetch it from --mcpb-url instead.
-    SCRIPT_DIR="$(cd "$(dirname "$0")" 2>/dev/null && pwd)"
-    MCPB="${SCRIPT_DIR:-}/AI-Vault.mcpb"
-    echo ""
-    if [ ! -f "$MCPB" ] && [ -n "$MCPB_URL" ]; then
-        echo "Fetching the Claude extension..."
-        MCPB_TMP="$(mktemp -d)/AI-Vault.mcpb"
-        if curl -fsSL -m 120 -o "$MCPB_TMP" "$MCPB_URL"; then
-            MCPB="$MCPB_TMP"
-            xattr -d com.apple.quarantine "$MCPB" 2>/dev/null || true
-        else
-            echo "  Could not download the extension automatically — we can add it by hand at the end."
-        fi
-    fi
-    if [ "$TEST_MODE" = "1" ]; then
-        echo "TEST MODE: would now open $MCPB in Claude Desktop's install window."
-    else
-        [ -f "$MCPB" ] || die "The AI-Vault extension file is missing from this download."
-        open "$MCPB" || die "Could not open the AI-Vault extension. Is Claude Desktop installed?"
-    fi
+# ---------- 7. auto-wire the AI apps -----------------------------------------
+# The vault is on disk; now point Claude Desktop and/or Codex at it with a
+# standalone connector binary — no folder picker, no .mcpb, no Codex setup.
+echo ""
+echo "Step 6 of 6: Connecting your vault to Claude / Codex..."
 
-    # Open the vault folder so it's easy to find if they prefer to browse.
-    open "$VAULT_DIR" 2>/dev/null || true
-    echo ""
-    echo "============================================================"
-    echo "   ALMOST DONE — two clicks in the Claude window that just opened:"
-    echo ""
-    echo "   1. Click the blue  Install  button."
-    echo "   2. It asks for your Vault folder. Paste this into the box,"
-    echo "      then click Open:"
-    echo ""
-    echo "        $VAULT_DIR"
-    echo ""
-    echo "   Done. Ask Claude a question about your business, e.g."
-    echo "   \"How do we complete the monthly statement?\""
-    echo "============================================================"
-    echo ""
-else
-    # ---------- 7. Linux: no Claude Desktop -----------------------------------
-    # Claude Desktop (and its AI-Vault extension) is Mac/Windows only. On Linux
-    # the vault is on disk; point the person's AI tool at it via the MCP server.
-    echo ""
-    echo "============================================================"
-    echo "   DONE — your vault is on this computer:"
-    echo ""
-    echo "   $VAULT_DIR"
-    echo ""
-    echo "   Claude Desktop (Mac/Windows) uses the AI-Vault extension to read"
-    echo "   this folder. On Linux, wire the vault MCP server into your AI tool"
-    echo "   (Codex CLI etc.) — see CONNECT.md in the download repo:"
-    echo "   https://github.com/AgentEA-AUS/ai-vault-install"
-    echo "============================================================"
-    echo ""
+# a) download the right connector binary for this OS/arch, then prove it runs.
+case "$ARCH" in
+    arm64) CONN_ARCH="arm64" ;;
+    amd64) CONN_ARCH="x64" ;;
+    *)     die "This $NOUN has an unsupported processor type for the connector." ;;
+esac
+case "$OS" in
+    Darwin) CONN_OS="darwin" ;;
+    Linux)  CONN_OS="linux" ;;
+esac
+CONNECTOR_SRC="${CONNECTOR_URL_BASE}/vault-connector-${CONN_OS}-${CONN_ARCH}"
+if [ ! -x "$CONNECTOR" ]; then
+    echo "  Downloading the vault connector..."
+    curl -fsSL -m 300 -o "$CONNECTOR" "$CONNECTOR_SRC" \
+        || die "Could not download the vault connector. Check this $NOUN is online, then run the installer line again."
+    chmod +x "$CONNECTOR"
+    [ "$OS" = "Darwin" ] && { xattr -d com.apple.quarantine "$CONNECTOR" 2>/dev/null || true; }
 fi
+# Verify: non-empty AND actually answers an MCP "initialize" over stdio.
+[ -s "$CONNECTOR" ] || die "The vault connector did not download properly. Run the installer line again."
+if ! printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"install","version":"0"}}}' \
+    | "$CONNECTOR" "$VAULT_DIR" 2>/dev/null | head -1 | grep -q '"jsonrpc"'; then
+    die "The vault connector would not start on this $NOUN. Run the installer line again; if it keeps failing, call AgentEA."
+fi
+
+WIRED_CLAUDE=0
+WIRED_CODEX=0
+
+# b) Claude Desktop — merge our one entry into its config, never clobbering any
+#    other keys or servers. In TEST MODE the config is a throwaway file.
+CLAUDE_PRESENT=0
+if [ "$TEST_MODE" = "1" ]; then
+    CLAUDE_PRESENT=1                          # always exercise the merge in tests
+elif [ "$OS" = "Darwin" ] && [ -d "/Applications/Claude.app" ]; then
+    CLAUDE_PRESENT=1
+fi
+if [ "$CLAUDE_PRESENT" = "1" ] && [ -n "$CLAUDE_CONFIG" ]; then
+    command -v python3 >/dev/null 2>&1 \
+        || die "This $NOUN is missing a standard tool (python3) needed to connect Claude."
+    # Back the existing config up once before we ever touch it.
+    if [ -f "$CLAUDE_CONFIG" ] && [ ! -f "$CLAUDE_CONFIG.agentea-backup" ]; then
+        cp "$CLAUDE_CONFIG" "$CLAUDE_CONFIG.agentea-backup" 2>/dev/null || true
+    fi
+    claude_config_merge "$CLAUDE_CONFIG" || die "Could not update Claude's settings."
+    WIRED_CLAUDE=1
+    echo "  Connected to Claude Desktop."
+fi
+
+# c) Codex — non-interactive, remove-then-add so re-running is idempotent. A
+#    Codex hiccup must never fail the whole install: warn and carry on.
+if command -v codex >/dev/null 2>&1; then
+    # codex writes into its home but won't create it, so ensure it exists first.
+    if [ "$TEST_MODE" = "1" ]; then CODEX_HOME_DIR="$AIVAULT_TEST_DIR/codex"; else CODEX_HOME_DIR="${CODEX_HOME:-$HOME/.codex}"; fi
+    mkdir -p "$CODEX_HOME_DIR" 2>/dev/null || true
+    env CODEX_HOME="$CODEX_HOME_DIR" codex mcp remove business_vault >/dev/null 2>&1 || true
+    if env CODEX_HOME="$CODEX_HOME_DIR" codex mcp add business_vault -- "$CONNECTOR" "$VAULT_DIR" </dev/null >/dev/null 2>&1; then
+        WIRED_CODEX=1
+        echo "  Connected to Codex."
+    else
+        echo "  NOTE: found Codex but could not wire it automatically — skipping it."
+    fi
+fi
+
+# d) Nothing to wire into — the vault is still synced; re-running wires it.
+if [ "$WIRED_CLAUDE" = "0" ] && [ "$WIRED_CODEX" = "0" ]; then
+    [ "$TEST_MODE" = "1" ] || open "$VAULT_DIR" 2>/dev/null || true
+    echo ""
+    echo "============================================================"
+    echo "   YOUR VAULT IS READY on this $NOUN:"
+    echo ""
+    echo "     $VAULT_DIR"
+    echo ""
+    echo "   We couldn't find Claude or Codex on this computer. Install one"
+    echo "   of them (claude.ai/download or the Codex CLI), then paste this"
+    echo "   same line again — it will connect the vault automatically."
+    echo "============================================================"
+    echo ""
+    exit 0
+fi
+
+# e) Final message — name exactly what was wired.
+[ "$TEST_MODE" = "1" ] || open "$VAULT_DIR" 2>/dev/null || true
+WIRED_LIST=""
+[ "$WIRED_CLAUDE" = "1" ] && WIRED_LIST="Claude Desktop"
+if [ "$WIRED_CODEX" = "1" ]; then
+    if [ -n "$WIRED_LIST" ]; then WIRED_LIST="$WIRED_LIST and Codex"; else WIRED_LIST="Codex"; fi
+fi
+echo ""
+echo "============================================================"
+echo "   DONE — your vault is connected on this $NOUN."
+echo ""
+echo "   Wired into: $WIRED_LIST"
+echo "   Your vault: $VAULT_DIR"
+if [ "$WIRED_CLAUDE" = "1" ]; then
+    echo ""
+    echo "   Close Claude completely and open it again, then ask a question"
+    echo "   about your business, e.g. \"How do we complete the monthly statement?\""
+fi
+echo "============================================================"
+echo ""
