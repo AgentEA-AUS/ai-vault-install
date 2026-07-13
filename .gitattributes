@@ -1,0 +1,2 @@
+# Keep PowerShell files UTF-8 without BOM. A leading BOM breaks the one-line scriptblock invite on Windows PowerShell 5.1.
+*.ps1 text eol=lf

@@ -68,6 +68,7 @@ Common ones and what they mean:
 | `We couldn't find Claude or Codex on this computer` | Neither AI app is installed | Have them install Claude from claude.ai/download, then run the same line again |
 | `The vault did not arrive. Your invite may have expired or already been used` | The one-time code is spent or older than 7 days | Ask AgentEA for a fresh invite line |
 | `There is already a folder at ...AI-Vault that has other files in it` | Something unrelated is in the way | Ask them to rename that folder, then run the line again |
+| Red text about `assignment expression is not valid` on `$ServerId` / `$FolderId` | One-line download hit bad encoding (UTF-8 BOM) in older install.ps1 | Pull latest (same email line usually works after this fix). If needed: download to a file first, then run with their `-Token` |
 | `Could not reach the download site` | No internet, or a firewall is blocking it | Check the connection and run the line again |
 
 Re-running the line is always safe. It skips whatever is already done.

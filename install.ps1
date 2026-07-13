@@ -1,4 +1,4 @@
-﻿# AI Vault installer  - AgentEA (Windows)
+# AI Vault installer  - AgentEA (Windows)
 # Sets up a private, receive-only copy of your business vault on this PC, then
 # auto-wires it into Claude Desktop and/or Codex with a standalone connector
 # binary  - no folder picker, no .mcpb, no Codex setup by hand.
